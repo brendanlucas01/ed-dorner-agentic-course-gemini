@@ -1,5 +1,5 @@
 from dotenv import load_dotenv
-from openai import OpenAI
+from google import genai
 import json
 import os
 import requests
@@ -8,6 +8,7 @@ import gradio as gr
 
 
 load_dotenv(override=True)
+genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
 def push(text):
     requests.post(
@@ -28,55 +29,51 @@ def record_unknown_question(question):
     push(f"Recording {question}")
     return {"recorded": "ok"}
 
-record_user_details_json = {
-    "name": "record_user_details",
-    "description": "Use this tool to record that a user is interested in being in touch and provided an email address",
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "email": {
-                "type": "string",
-                "description": "The email address of this user"
-            },
-            "name": {
-                "type": "string",
-                "description": "The user's name, if they provided it"
-            }
-            ,
-            "notes": {
-                "type": "string",
-                "description": "Any additional information about the conversation that's worth recording to give context"
+tools = {
+    "function_declarations": [
+        {
+            "name": "record_user_details",
+            "description": "Use this tool to record that a user is interested in being in touch and provided an email address",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "email": {
+                        "type": "string",
+                        "description": "The email address of this user"
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "The user's name, if they provided it"
+                    },
+                    "notes": {
+                        "type": "string",
+                        "description": "Any additional information about the conversation that's worth recording to give context"
+                    }
+                },
+                "required": ["email"]
             }
         },
-        "required": ["email"],
-        "additionalProperties": False
-    }
+        {
+            "name": "record_unknown_question",
+            "description": "Always use this tool to record any question that couldn't be answered as you didn't know the answer",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "The question that couldn't be answered"
+                    }
+                },
+                "required": ["question"]
+            }
+        }
+    ]
 }
-
-record_unknown_question_json = {
-    "name": "record_unknown_question",
-    "description": "Always use this tool to record any question that couldn't be answered as you didn't know the answer",
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "question": {
-                "type": "string",
-                "description": "The question that couldn't be answered"
-            },
-        },
-        "required": ["question"],
-        "additionalProperties": False
-    }
-}
-
-tools = [{"type": "function", "function": record_user_details_json},
-        {"type": "function", "function": record_unknown_question_json}]
 
 
 class Me:
 
     def __init__(self):
-        self.openai = OpenAI()
         self.name = "Ed Donner"
         reader = PdfReader("me/linkedin.pdf")
         self.linkedin = ""
@@ -86,13 +83,14 @@ class Me:
                 self.linkedin += text
         with open("me/summary.txt", "r", encoding="utf-8") as f:
             self.summary = f.read()
+        self.model = genai.GenerativeModel('gemini-2.5-flash-mini', system_instruction=self.system_prompt())
 
 
     def handle_tool_call(self, tool_calls):
         results = []
         for tool_call in tool_calls:
             tool_name = tool_call.function.name
-            arguments = json.loads(tool_call.function.arguments)
+            arguments = tool_call.function.args
             print(f"Tool called: {tool_name}", flush=True)
             tool = globals().get(tool_name)
             result = tool(**arguments) if tool else {}
@@ -113,19 +111,19 @@ If the user is engaging in discussion, try to steer them towards getting in touc
         return system_prompt
     
     def chat(self, message, history):
-        messages = [{"role": "system", "content": self.system_prompt()}] + history + [{"role": "user", "content": message}]
+        history = [{"role": "model" if h["role"] == "assistant" else h["role"], "parts": [h["content"]]} for h in history]
+        messages = history + [{"role": "user", "content": message}]
         done = False
         while not done:
-            response = self.openai.chat.completions.create(model="gpt-4o-mini", messages=messages, tools=tools)
-            if response.choices[0].finish_reason=="tool_calls":
-                message = response.choices[0].message
-                tool_calls = message.tool_calls
+            response = self.model.generate_content(messages, tools=tools)
+            if response.candidates[0].finish_reason.name == "TOOL_EXECUTION":
+                tool_calls = response.candidates[0].tool_calls
                 results = self.handle_tool_call(tool_calls)
-                messages.append(message)
+                messages.append(response.candidates[0].content)
                 messages.extend(results)
             else:
                 done = True
-        return response.choices[0].message.content
+        return response.text
     
 
 if __name__ == "__main__":
